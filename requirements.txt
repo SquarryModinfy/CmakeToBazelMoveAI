@@ -1,4 +1,5 @@
 openai
 pyyaml
-cmake-ast
 python-docx
+cmakeast
+pyinstaller

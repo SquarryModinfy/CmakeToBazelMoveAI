@@ -1,12 +1,45 @@
 import os
 import yaml
+import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 from openai import OpenAI
 import cmakeast
 from docx import Document
 
-openai = OpenAI(base_url=os.getenv("LLM_API_URL"), api_key=os.getenv("LLM_API_KEY"))
+def load_config() -> Dict:
+    config = {
+        "llm_api": {
+            "url": os.getenv("LLM_API_URL"),
+            "api_key": os.getenv("LLM_API_KEY")
+        }
+    }
+    
+    # Try loading from config.yaml as fallback
+    try:
+        config_path = Path(__file__).parent / "config.yaml"
+        if config_path.exists():
+            with open(config_path) as f:
+                yaml_config = yaml.safe_load(f)
+                # Only use yaml values if environment variables are not set
+                if not config["llm_api"]["url"]:
+                    config["llm_api"]["url"] = yaml_config["llm_api"]["url"]
+                if not config["llm_api"]["api_key"]:
+                    config["llm_api"]["api_key"] = yaml_config["llm_api"]["api_key"]
+    except Exception as e:
+        print(f"Warning: Could not load config.yaml: {e}")
+    
+    # Validate config
+    if not config["llm_api"]["url"] or not config["llm_api"]["api_key"]:
+        raise ValueError("LLM API URL and API key must be provided either through environment variables (LLM_API_URL, LLM_API_KEY) or config.yaml")
+    
+    return config
+
+config = load_config()
+openai = OpenAI(
+    base_url=config["llm_api"]["url"],
+    api_key=config["llm_api"]["api_key"]
+)
 
 def parse_cmake(file_path: Path) -> Dict:
     with file_path.open() as f:
@@ -39,18 +72,61 @@ def parse_cmake(file_path: Path) -> Dict:
                     target["deps"].extend(deps)
     return ir
 
+def generate_bazel_target(target: Dict) -> str:
+    """Generate Bazel target configuration for a single target"""
+    rule = "cc_library" if target['type'] == "static_library" else "cc_binary"
+    parts = []
+    parts.append(f"{rule}(")
+    parts.append(f"    name = \"{target['name']}\",")
+    parts.append(f"    srcs = {target['sources']},")
+    if target["include_dirs"]:
+        parts.append(f"    includes = {target['include_dirs']},")
+    parts.append(f"    deps = {target['deps']},")
+    parts.append(")")
+    return "\n".join(parts)
+
 def generate_bazel_build(ir: Dict) -> str:
-    build_file = ""
-    for target in ir["targets"]:
-        rule = "cc_library" if target['type'] == "static_library" else "cc_binary"
-        build_file += f"{rule}(\n"
-        build_file += f"    name = \"{target['name']}\",\n"
-        build_file += f"    srcs = {target['sources']},\n"
-        if target["include_dirs"]:
-            build_file += f"    includes = {target['include_dirs']},\n"
-        build_file += f"    deps = {target['deps']},\n"
-        build_file += ")\n\n"
-    return build_file
+    return "\n\n".join(generate_bazel_target(target) for target in ir["targets"])
+
+def structure_docs_by_topic(documents: List[str]) -> Dict[str, str]:
+    """Group documentation by topics to provide more focused context"""
+    topics = {
+        "build": [],
+        "deployment": [], 
+        "testing": []
+    }
+    
+    for doc in documents:
+        if any(word in doc.lower() for word in ["build", "compile", "bazel"]):
+            topics["build"].append(doc)
+        if any(word in doc.lower() for word in ["deploy", "release"]):
+            topics["deployment"].append(doc)
+        if any(word in doc.lower() for word in ["test", "check"]):
+            topics["testing"].append(doc)
+            
+    return {k: "\n\n".join(v) for k,v in topics.items()}
+
+def validate_bazel_config(build_content: str) -> Tuple[bool, str]:
+    """Validate generated Bazel build file"""
+    required_patterns = [
+        r"cc_(library|binary)",
+        r"name\s*=",
+        r"srcs\s*="
+    ]
+    
+    for pattern in required_patterns:
+        if not re.search(pattern, build_content):
+            return False, f"Missing required pattern: {pattern}"
+            
+    return True, ""
+
+def postprocess_config(config: Dict) -> Dict:
+    """Clean up and normalize generated config"""
+    if "build" not in config:
+        config["build"] = {}
+    if "tool" not in config["build"]:
+        config["build"]["tool"] = "bazel"
+    return config
 
 def load_rag_docs(doc_path: Path) -> str:
     documents = []
@@ -63,12 +139,22 @@ def load_rag_docs(doc_path: Path) -> str:
     return "\n\n".join(documents)
 
 def query_ci_config(doc_path: Path, context_query: str) -> str:
-    context = load_rag_docs(doc_path)
+    docs = load_rag_docs(doc_path)
+    structured_docs = structure_docs_by_topic(docs.split("\n\n"))
+    
+    # Use relevant section based on query keywords
+    context = structured_docs["build"]  
+    
     prompt = f"""
-    На основе следующей документации:
+    Based on this BUILD documentation:
     {context}
 
-    Ответь на вопрос: {context_query}
+    Question: {context_query}
+    
+    Generate YAML configuration following the structure:
+    build:
+      tool: bazel 
+      targets: [list of targets]
     """
     response = openai.chat.completions.create(
         model="gpt-4",
@@ -86,12 +172,25 @@ def generate_asgard_config(doc_path: Path, component_name: str) -> Dict:
 def migrate_component(component_path: Path, asgard_doc_path: Path):
     ir = parse_cmake(component_path / "CMakeLists.txt")
     build_txt = generate_bazel_build(ir)
+    
+    is_valid, error = validate_bazel_config(build_txt)
+    if not is_valid:
+        print(f"Warning: Generated BUILD file may be invalid: {error}")
+        
     (component_path / "BUILD.bazel").write_text(build_txt)
 
     asgard_config = generate_asgard_config(asgard_doc_path, component_path.name)
+    asgard_config = postprocess_config(asgard_config)
     (component_path / "config.yaml").write_text(yaml.dump(asgard_config))
 
     print("Миграция завершена. Проверьте BUILD.bazel и config.yaml.")
+
+def migrate_from_paths(component_path: str, asgard_doc_path: str) -> Tuple[bool, str]:
+    try:
+        migrate_component(Path(component_path), Path(asgard_doc_path))
+        return True, "Миграция успешно завершена"
+    except Exception as e:
+        return False, f"Ошибка при миграции: {str(e)}"
 
 if __name__ == "__main__":
     import argparse
@@ -100,5 +199,5 @@ if __name__ == "__main__":
     parser.add_argument("asgard_doc_path", type=str, help="Путь к документации Asgard")
     args = parser.parse_args()
 
-    migrate_component(Path(args.component_path), Path(args.asgard_doc_path))
-    print("Миграция завершена.")
+    success, message = migrate_from_paths(args.component_path, args.asgard_doc_path)
+    print(message)
