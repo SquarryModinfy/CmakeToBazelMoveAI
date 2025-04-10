@@ -7,7 +7,7 @@
 
  - Генерация BUILD.bazel на основе промежуточного представления (IR)
 
- - Чтение документации Asgard и генерация config.yaml с помощью LLM
+ - Чтение документации кастомного CI и генерация config.yaml с помощью LLM
 
  - Поддержка RAG-подхода (Retrieval-Augmented Generation)
 
@@ -25,7 +25,7 @@ export LLM_API_KEY=your-token
 
 ## Использование
 ```bash
-python migrator.py ./path/to/component ./path/to/asgard/docs
+python migrator.py ./path/to/component ./path/to/ci/docs
 component_path: Папка с CMakeLists.txt
 
 asgard_doc_path: Папка с документацией .md, .txt, .docx
@@ -46,7 +46,7 @@ python-docx
 
 ## Пример
 ```bash
-python migrator.py ./components/libfoo ./asgard_docs/
+python migrator.py ./components/libfoo ./ci_docs/
 ```
 ## Результат:
 
